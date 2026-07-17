@@ -1,0 +1,1526 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r 01_install, echo=FALSE, message=TRUE}
+
+pkgs <- c("arrow","dplyr","tidyr","ggplot2","stringr",
+          "purrr","lubridate","janitor","forcats","broom")
+new <- setdiff(pkgs, rownames(installed.packages()))
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
+```
+
+```{r 02_load, message=FALSE, warning=FALSE}
+library(arrow);    library(dplyr);   library(tidyr);  library(ggplot2)
+library(stringr);  library(purrr);   library(lubridate)
+library(janitor);  library(forcats)
+```
+
+```{r}
+panel <- read_parquet("data_final/panel_cbsa_q.parquet")
+dim(panel); head(panel)
+```
+
+```{r 63_time_series, message=FALSE, warning=FALSE, fig.width=7, fig.height=4}
+
+pick_col <- function(df, candidates, required = FALSE) {
+  f <- intersect(candidates, names(df))
+  if (length(f)) return(f[1])
+  if (required) stop(paste("Missing required column. Tried:", paste(candidates, collapse=", ")))
+  NA_character_
+}
+make_quarter <- function(year, qnum) {
+  if (is.factor(year)) year <- as.character(year)
+  if (is.factor(qnum)) qnum <- as.character(qnum)
+  year <- as.integer(year)
+  qnum <- as.integer(qnum)
+  as.Date(paste0(year, "-", (qnum - 1) * 3 + 1, "-01"))
+}
+
+
+col_region  <- pick_col(panel, c("cbsa","cbsa_code","cbsa_fips","cbsa_id","region","msa","cz"), TRUE)
+col_rname   <- pick_col(panel, c("cbsa_name","region_name","msa_name","name"))
+col_year    <- pick_col(panel, c("year","yr"), TRUE)
+col_qnum    <- pick_col(panel, c("quarter","qtr","quarter_number"), TRUE)
+
+
+col_pop_y   <- pick_col(panel, c("pop_22_27","pop_young","pop_ba_22_27","pop_18_29","young_pop"))
+col_u_ba    <- pick_col(panel, c("u_22_27_ba","u_ba_22_27","unemp_ba_22_27","urate_ba_22_27","u_ba"))
+col_u_all   <- pick_col(panel, c("u_all","unemp_all","urate_all","u_overall"))
+col_d_post  <- pick_col(panel, c("postings_index","demand_post_rt","post_per_young","postings_rt","postings_ba_rt","demand_post","ba_postings_rate"))
+col_s_flow  <- pick_col(panel, c("flow_ba","supply_flow_rt","ba_flow_rt","supply_flow","grad_flow_rt"))
+
+
+DFw <- panel %>%
+  dplyr::mutate(
+    .region = .data[[col_region]],
+    .rname  = if (!is.na(col_rname)) .data[[col_rname]] else as.character(.data[[col_region]]),
+    .quarter = make_quarter(.data[[col_year]], .data[[col_qnum]]),
+    u_ba   = if (!is.na(col_u_ba))  as.numeric(.data[[col_u_ba]])  else NA_real_,
+    u_all  = if (!is.na(col_u_all)) as.numeric(.data[[col_u_all]]) else NA_real_,
+    d_post = if (!is.na(col_d_post)) as.numeric(.data[[col_d_post]]) else NA_real_,
+    s_flow = if (!is.na(col_s_flow)) as.numeric(.data[[col_s_flow]]) else NA_real_,
+    pop_y  = if (!is.na(col_pop_y))  as.numeric(.data[[col_pop_y]]) else NA_real_
+  ) %>%
+  dplyr::select(.region, .rname, .quarter, u_ba, u_all, d_post, s_flow, pop_y) %>%
+  dplyr::arrange(.region, .quarter)
+
+
+weight_available <- any(!is.na(DFw$pop_y))
+agg_fun <- function(x, w) if (weight_available) stats::weighted.mean(x, w, na.rm = TRUE) else mean(x, na.rm = TRUE)
+
+nat_ts <- DFw %>%
+  dplyr::group_by(.quarter) %>%
+  dplyr::summarise(
+    u_ba_nat  = agg_fun(u_ba,  pop_y),
+    u_all_nat = agg_fun(u_all, pop_y),
+    .groups = "drop"
+  )
+
+print(
+  ggplot(nat_ts, aes(.quarter)) +
+    geom_line(aes(y = u_ba_nat)) +
+    geom_line(aes(y = u_all_nat), linetype = 2) +
+    labs(title = "National Unemployment: BA 22–27 vs All",
+         x = "Quarter", y = "Unemployment rate",
+         caption = if (weight_available) "Population-weighted by young pop" else "Unweighted mean across regions")
+)
+
+
+quartile_by <- function(v) {
+  vv <- v[is.finite(v)]
+  if (length(unique(vv)) < 2) return(factor(rep("All regions", length(v)), levels = "All regions"))
+  cut(v, breaks = quantile(v, c(0,.25,.5,.75,1), na.rm = TRUE),
+      include.lowest = TRUE, labels = c("Q1 (Low)","Q2","Q3","Q4 (High)"))
+}
+
+reg_means <- DFw %>%
+  dplyr::group_by(.region) %>%
+  dplyr::summarise(d_post_mean = mean(d_post, na.rm = TRUE),
+                   s_flow_mean = mean(s_flow, na.rm = TRUE),
+                   .groups = "drop") %>%
+  dplyr::mutate(d_post_q = quartile_by(d_post_mean),
+                s_flow_q = quartile_by(s_flow_mean))
+
+DFq <- DFw %>% dplyr::left_join(reg_means %>% dplyr::select(.region, d_post_q, s_flow_q), by = ".region")
+
+series_by_q <- function(df, qvar, yvar) {
+  df %>%
+    dplyr::group_by(.quarter, .data[[qvar]]) %>%
+    dplyr::summarise(val = agg_fun(.data[[yvar]], pop_y), .groups = "drop")
+}
+
+
+ts_ba_d  <- series_by_q(DFq, "d_post_q", "u_ba")
+ts_all_d <- series_by_q(DFq, "d_post_q", "u_all")
+
+print(
+  ggplot(ts_ba_d, aes(.quarter, val, color = d_post_q)) +
+    geom_line() +
+    labs(title = "U(BA 22–27) by Demand (Postings) Quartile",
+         x = "Quarter", y = "Unemployment rate", color = "Demand quartile")
+)
+print(
+  ggplot(ts_all_d, aes(.quarter, val, color = d_post_q)) +
+    geom_line() +
+    labs(title = "U(All) by Demand (Postings) Quartile",
+         x = "Quarter", y = "Unemployment rate", color = "Demand quartile")
+)
+
+
+ts_ba_s  <- series_by_q(DFq, "s_flow_q", "u_ba")
+ts_all_s <- series_by_q(DFq, "s_flow_q", "u_all")
+
+print(
+  ggplot(ts_ba_s, aes(.quarter, val, color = s_flow_q)) +
+    geom_line() +
+    labs(title = "U(BA 22–27) by Supply Flow Quartile",
+         x = "Quarter", y = "Unemployment rate", color = "Supply quartile")
+)
+print(
+  ggplot(ts_all_s, aes(.quarter, val, color = s_flow_q)) +
+    geom_line() +
+    labs(title = "U(All) by Supply Flow Quartile",
+         x = "Quarter", y = "Unemployment rate", color = "Supply quartile")
+)
+```
+
+```{r 68_data_dictionary, message=FALSE}
+
+if (!dir.exists("out")) dir.create("out")
+if (!dir.exists("out/tables")) dir.create("out/tables", recursive = TRUE)
+
+
+example_of <- function(x) {
+  v <- x[!is.na(x)][1]
+  if (length(v) == 0) return(NA_character_)
+  as.character(v)
+}
+
+
+definitions <- c(
+  cbsa                     = "Core Based Statistical Area code (5-digit GEOID).",
+  cbsa_code                = "Core Based Statistical Area code (5-digit GEOID).",
+  cbsa_fips                = "Core Based Statistical Area code (5-digit GEOID).",
+  cbsa_id                  = "Core Based Statistical Area code (5-digit GEOID).",
+  cbsa_name                = "CBSA name.",
+  region                   = "Region identifier (CBSA/MSA/CZ).",
+  region_name              = "Region name.",
+  year                     = "Calendar year.",
+  quarter                  = "Quarter number (1–4).",
+  qtr                      = "Quarter number (1–4).",
+  u_22_27_ba               = "Unemployment rate for BA-holding ages 22–27 (region-quarter).",
+  u_ba_22_27               = "Unemployment rate for BA-holding ages 22–27 (region-quarter).",
+  u_all                    = "Unemployment rate for all workers (region-quarter).",
+  lf_w                     = "Population / labor-force weight used for aggregation (region-quarter).",
+  pop_22_27                = "Population age 22–27 (count) used for weights.",
+  young_pop                = "Young population used for weights (count).",
+  flow_ba                  = "BA completions (supply flow) in region-quarter.",
+  flow_ba_l1               = "Lag 1 of BA completions (region-quarter).",
+  flow_ba_l2               = "Lag 2 of BA completions (region-quarter).",
+  supply_flow_rt           = "Supply flow rate (new BA per young population).",
+  supply_stock_rt          = "Supply stock rate (BA stock per young population).",
+  postings_index           = "Job postings index (base ≈ 100).",
+  postings_rt              = "Job postings per young population (rate).",
+  demand_post_rt           = "Demand proxy: postings per young population (rate).",
+  bartik_demand            = "Bartik demand shifter (industry shift–share), unitless.",
+  jolts_openings_rate_us   = "US job openings rate (JOLTS)."
+)
+
+
+unit_for <- function(nm, x) {
+  nml <- tolower(nm)
+  xnum <- suppressWarnings(as.numeric(x))
+  finite <- is.finite(xnum)
+
+  if (nml %in% c("year")) return("year")
+  if (nml %in% c("quarter","qtr","quarter_number")) return("1–4")
+  if (grepl("cbsa", nml)) return("5-digit code")
+  if (grepl("index", nml)) return("index (base=100)")
+  if (grepl("bartik", nml)) return("unitless index")
+  if (grepl("openings_rate", nml)) return("percent or rate")
+  if (grepl("^u_", nml)) return("rate (share or %)")
+
+
+  if (any(finite)) {
+    mn <- suppressWarnings(min(xnum[finite], na.rm = TRUE))
+    mx <- suppressWarnings(max(xnum[finite], na.rm = TRUE))
+
+    if (mn >= 0 && mx <= 1.5) return("rate (0–1)")
+
+    if (mn >= 0 && mx <= 100 && grepl("rate|share|pct|percent|u_", nml)) return("percent")
+
+    if (all(abs(xnum[finite] - round(xnum[finite])) < 1e-8)) return("count")
+  }
+  NA_character_
+}
+
+
+nm <- names(panel)
+classes <- vapply(panel, function(x) class(x)[1], character(1))
+n <- nrow(panel)
+n_missing <- vapply(panel, function(x) sum(is.na(x)), integer(1))
+pct_missing <- round(100 * n_missing / n, 2)
+n_unique <- vapply(panel, function(x) length(unique(x)), integer(1))
+examples <- vapply(panel, example_of, character(1))
+
+
+is_num <- vapply(panel, function(x) is.numeric(x) || is.integer(x), logical(1))
+num_min <- rep(NA_real_, length(nm)); num_max <- num_min; num_mean <- num_min; num_sd <- num_min
+num_min[is_num]  <- vapply(panel[is_num], function(x) suppressWarnings(min(x, na.rm = TRUE)), numeric(1))
+num_max[is_num]  <- vapply(panel[is_num], function(x) suppressWarnings(max(x, na.rm = TRUE)), numeric(1))
+num_mean[is_num] <- vapply(panel[is_num], function(x) suppressWarnings(mean(x, na.rm = TRUE)), numeric(1))
+num_sd[is_num]   <- vapply(panel[is_num], function(x) suppressWarnings(sd(x, na.rm = TRUE)), numeric(1))
+
+
+dict <- dplyr::tibble(
+  name        = nm,
+  class       = classes,
+  n_missing   = n_missing,
+  pct_missing = pct_missing,
+  n_unique    = n_unique,
+  example     = examples,
+  min         = num_min,
+  max         = num_max,
+  mean        = num_mean,
+  sd          = num_sd,
+  definition  = unname(definitions[name]),
+  unit        = vapply(seq_along(nm), function(i) unit_for(nm[i], panel[[i]]), character(1))
+)
+
+
+readr::write_csv(dict, "out/tables/data_dictionary.csv", na = "")
+cat("Saved: out/tables/data_dictionary.csv\n")
+dict |> dplyr::slice_head(n = 25)
+```
+
+```{r 69_to_72_baseline_ols_nolmtest, message=FALSE, warning=FALSE}
+
+pick_col <- function(df, candidates, required = FALSE) {
+  f <- intersect(candidates, names(df))
+  if (length(f)) return(f[1])
+  if (required) stop(paste("Missing required column. Tried:", paste(candidates, collapse=", ")))
+  NA_character_
+}
+coef_table <- function(model, vcov_mat = NULL) {
+  if (is.null(vcov_mat)) vcov_mat <- vcov(model)
+  b  <- coef(model)
+  se <- sqrt(diag(vcov_mat))
+  t  <- b / se
+  p  <- 2 * pt(-abs(t), df = df.residual(model))
+  data.frame(term = names(b), estimate = b, std.error = se, t = t, p = p, row.names = NULL)
+}
+vcov_cluster <- function(model, cluster_vec = NULL) {
+
+  if (!is.null(cluster_vec) && requireNamespace("sandwich", quietly = TRUE)) {
+    return(sandwich::vcovCL(model, cluster = cluster_vec))
+  }
+  message("Note: Using classical (non-clustered) SEs because 'sandwich' is not installed.")
+  vcov(model)
+}
+
+
+col_region <- pick_col(panel, c("cbsa","cbsa_code","cbsa_fips","cbsa_id","region","msa","cz"), TRUE)
+col_year   <- pick_col(panel, c("year","yr"), TRUE)
+col_qnum   <- pick_col(panel, c("quarter","qtr","quarter_number"), TRUE)
+
+
+col_U <- pick_col(panel, c("u_22_27_ba","u_ba_22_27","unemp_ba_22_27","urate_ba_22_27","u_ba"), TRUE)
+col_D <- pick_col(panel, c("demand_post_rt","postings_rt","post_per_young","d_post",
+                           "ba_postings_rate","postings_index","bartik_demand"), TRUE)
+col_S <- pick_col(panel, c("supply_flow_rt","ba_flow_rt","s_flow","flow_ba"), TRUE)
+
+
+X_candidates <- c("jolts_openings_rate_us","flow_ba_l1","flow_ba_l2","lf_w","pop_22_27","young_pop")
+X_vars <- intersect(X_candidates, names(panel))
+
+
+DF <- panel |>
+  dplyr::transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_qnum]]),
+    t_id   = interaction(year, qnum, drop = TRUE),
+    t_num  = (year - min(year, na.rm=TRUE)) * 4 + (qnum - 1),
+    U      = as.numeric(.data[[col_U]]),
+    D      = as.numeric(.data[[col_D]]),
+    S      = as.numeric(.data[[col_S]]),
+    !!!setNames(panel[, X_vars, drop = FALSE], X_vars)
+  ) |>
+  dplyr::filter(is.finite(U) & is.finite(D) & is.finite(S))
+
+
+rhs <- c("D","S", X_vars, "factor(region)", "factor(t_id)")
+form1 <- as.formula(paste("U ~", paste(rhs, collapse = " + ")))
+m1 <- lm(form1, data = DF)
+vc1 <- vcov_cluster(m1, cluster_vec = ~ region)
+ct1 <- coef_table(m1, vc1)
+
+
+form2 <- update(form1, . ~ . + factor(region):t_num)
+m2 <- lm(form2, data = DF)
+vc2 <- vcov_cluster(m2, cluster_vec = ~ region)
+ct2 <- coef_table(m2, vc2)
+
+
+fit_tbl <- data.frame(
+  model   = c("FE", "FE + region trends"),
+  R2      = c(summary(m1)$r.squared, summary(m2)$r.squared),
+  Adj_R2  = c(summary(m1)$adj.r.squared, summary(m2)$adj.r.squared),
+  AIC     = c(AIC(m1), AIC(m2)),
+  BIC     = c(BIC(m1), BIC(m2))
+)
+
+
+grab <- function(ct, nm) ct[match(nm, ct$term), c("estimate","std.error","p")]
+cmp <- data.frame(
+  term = c("D","S"),
+  FE_est  = grab(ct1,"D")$estimate,  FE_se  = grab(ct1,"D")$std.error,  FE_p  = grab(ct1,"D")$p,
+  FE_est_S= grab(ct1,"S")$estimate,  FE_se_S= grab(ct1,"S")$std.error,  FE_p_S= grab(ct1,"S")$p
+)
+
+cmp <- data.frame(
+  term = c("D","S"),
+  FE_est  = c(ct1$estimate[ct1$term=="D"], ct1$estimate[ct1$term=="S"]),
+  FE_se   = c(ct1$std.error[ct1$term=="D"], ct1$std.error[ct1$term=="S"]),
+  FE_p    = c(ct1$p[ct1$term=="D"],        ct1$p[ct1$term=="S"]),
+  FEtr_est= c(ct2$estimate[ct2$term=="D"], ct2$estimate[ct2$term=="S"]),
+  FEtr_se = c(ct2$std.error[ct2$term=="D"],ct2$std.error[ct2$term=="S"]),
+  FEtr_p  = c(ct2$p[ct2$term=="D"],        ct2$p[ct2$term=="S"])
+)
+
+
+m_vif_D <- lm(D ~ S, data = DF); R2_D_on_S <- summary(m_vif_D)$r.squared
+m_vif_S <- lm(S ~ D, data = DF); R2_S_on_D <- summary(m_vif_S)$r.squared
+VIF_D <- 1 / (1 - R2_D_on_S)
+VIF_S <- 1 / (1 - R2_S_on_D)
+rho_DS <- cor(DF$D, DF$S, use = "pairwise.complete.obs")
+
+
+cat("\n=== Baseline OLS with FE (cluster-robust if 'sandwich' available) ===\n")
+print(ct1[ct1$term %in% c("D","S"), ], row.names = FALSE)
+
+cat("\n=== OLS + Region Trends (cluster-robust if 'sandwich' available) ===\n")
+print(ct2[ct2$term %in% c("D","S"), ], row.names = FALSE)
+
+cat("\n=== Fit statistics ===\n"); print(fit_tbl, row.names = FALSE)
+
+cat("\n=== Multicollinearity diagnostics (D vs S) ===\n")
+cat(sprintf("Corr(D,S) = %.3f | VIF(D) = %.2f | VIF(S) = %.2f\n", rho_DS, VIF_D, VIF_S))
+
+
+cat("\nNOTE: These OLS models are DESCRIPTIVE.\n",
+    "They include region and time fixed effects (and optional controls),\n",
+    "and the trend-augmented model adds region-specific linear trends.\n",
+    "Coefficients on D and S should NOT be interpreted causally due to potential\n",
+    "omitted variables, simultaneity/endogeneity, and measurement error.\n", sep = "")
+```
+
+```{r 73_to_77_first_stage, message=FALSE, warning=FALSE}
+library(dplyr)
+
+
+pick_col <- function(df, candidates, required = FALSE) {
+  f <- intersect(candidates, names(df))
+  if (length(f)) return(f[1])
+  if (required) stop(paste("Missing required column. Tried:", paste(candidates, collapse=", ")))
+  NA_character_
+}
+vcov_cluster <- function(model, cluster_vec = NULL) {
+  if (!is.null(cluster_vec) && requireNamespace("sandwich", quietly = TRUE)) {
+    return(sandwich::vcovCL(model, cluster = cluster_vec))
+  }
+  message("Note: Robust KP-style F uses classical vcov (sandwich not installed).")
+  vcov(model)
+}
+wald_F <- function(model, terms, vc=NULL) {
+
+  if (is.null(vc)) vc <- vcov(model)
+  b <- coef(model)[terms]
+  q <- length(terms)
+  if (any(is.na(b)) || q == 0) return(NA_real_)
+  V <- vc[terms, terms, drop=FALSE]
+  as.numeric(t(b) %*% solve(V) %*% b) / q
+}
+partial_R2 <- function(m_restricted, m_full) {
+  sse0 <- sum(resid(m_restricted)^2)
+  sse1 <- sum(resid(m_full)^2)
+  if (!is.finite(sse0) || sse0 <= 0) return(NA_real_)
+  (sse0 - sse1) / sse0
+}
+
+
+col_region <- pick_col(panel, c("cbsa","cbsa_code","cbsa_fips","cbsa_id","region","msa","cz"), TRUE)
+col_year   <- pick_col(panel, c("year","yr"), TRUE)
+col_qnum   <- pick_col(panel, c("quarter","qtr","quarter_number"), TRUE)
+
+
+col_D <- pick_col(panel, c("demand_post_rt","postings_rt","post_per_young","d_post",
+                           "ba_postings_rate","postings_index"), TRUE)
+col_S <- pick_col(panel, c("supply_flow_rt","ba_flow_rt","s_flow","flow_ba"), TRUE)
+
+
+col_Bartik <- pick_col(panel, c("bartik_demand","demand_bartik_rt","bartik","d_bart","bartik_rt"), TRUE)
+supplyIV_candidates <- c("supply_iv","supplyiv","cohort_size","cohort_growth","hs_grads",
+                         "hs_grad_cohort","capacity","capacity_iv","funding_iv","funding_shock",
+                         "tuition_shock","flow_ba_l1","flow_ba_l2","flow_ba_l3")
+sIV <- intersect(supplyIV_candidates, names(panel))
+if (length(sIV) == 0) message("Warning: No explicit supply IVs found; using lagged flows if present.")
+
+
+X_candidates <- c("jolts_openings_rate_us","lf_w","pop_22_27","young_pop")
+X_vars <- intersect(X_candidates, names(panel))
+
+
+DF <- panel %>%
+  transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_qnum]]),
+    t_id   = interaction(year, qnum, drop = TRUE),
+    D      = as.numeric(.data[[col_D]]),
+    S      = as.numeric(.data[[col_S]]),
+    Bartik = as.numeric(.data[[col_Bartik]]),
+    !!!setNames(panel[, sIV, drop=FALSE], sIV),
+    !!!setNames(panel[, X_vars, drop=FALSE], X_vars)
+  ) %>%
+  filter(is.finite(D) & is.finite(S) & is.finite(Bartik))
+
+
+rhs_base <- c(X_vars, "factor(region)", "factor(t_id)")
+formD0 <- as.formula(paste("D ~", paste(rhs_base, collapse = " + ")))
+formD1 <- as.formula(paste("D ~ Bartik +", paste(rhs_base, collapse = " + ")))
+
+mD0 <- lm(formD0, data = DF)
+mD1 <- lm(formD1, data = DF)
+
+vcD <- vcov_cluster(mD1, cluster_vec = ~ region)
+F_KP_D <- wald_F(mD1, "Bartik", vcD)
+R2_partial_D <- partial_R2(mD0, mD1)
+
+DF$D_hat <- fitted(mD1)
+
+
+if (length(sIV) > 0) {
+  formS0 <- as.formula(paste("S ~", paste(rhs_base, collapse = " + ")))
+  formS1 <- as.formula(paste("S ~", paste(sIV, collapse = " + "), "+", paste(rhs_base, collapse = " + ")))
+  mS0 <- lm(formS0, data = DF)
+  mS1 <- lm(formS1, data = DF)
+
+  vcS <- vcov_cluster(mS1, cluster_vec = ~ region)
+  F_KP_S <- wald_F(mS1, sIV, vcS)
+  R2_partial_S <- partial_R2(mS0, mS1)
+
+  DF$S_hat <- fitted(mS1)
+} else {
+  F_KP_S <- NA_real_; R2_partial_S <- NA_real_
+  DF$S_hat <- NA_real_
+}
+
+
+cat("\n=== Demand first stage (D ~ Bartik + FE + X) ===\n")
+cat(sprintf("Partial R^2 (Bartik | FE,X): %.3f\n", R2_partial_D))
+cat(sprintf("KP-style robust F (Bartik):  %.2f\n", F_KP_D))
+
+cat("\n=== Supply first stage (S ~ SupplyIV(s) + FE + X) ===\n")
+cat(sprintf("Partial R^2 (SupplyIV | FE,X): %.3f\n", R2_partial_S))
+cat(sprintf("KP-style robust F (joint):    %.2f  (q = %d IVs)\n", F_KP_S, length(sIV)))
+
+
+flag <- function(Fstat) if (is.na(Fstat)) "n/a" else if (Fstat < 10) "⚠︎ <10 (weak)" else "OK"
+cat("\nWeak-IV check (rule-of-thumb F≥10):\n",
+    " Demand IV: ", flag(F_KP_D), "\n",
+    " Supply IVs:", flag(F_KP_S), "\n", sep = "")
+
+if (!exists("first_stage_out", inherits = FALSE)) {
+  first_stage_out <- DF %>% select(region, year, qnum, D_hat, S_hat)
+} else {
+  first_stage_out <- DF %>% select(region, year, qnum, D_hat, S_hat)
+}
+assign("first_stage_out", first_stage_out, envir = .GlobalEnv)
+cat("\nSaved predictions to object: first_stage_out (keys: region, year, qnum).\n")
+
+if (!is.na(F_KP_D) && F_KP_D < 10 || !is.na(F_KP_S) && F_KP_S < 10) {
+  cat("\nNOTE: At least one first-stage looks weak.\n",
+      "- Consider aggregating time (e.g., annual), refining Bartik exposures, or pooling multiple supply IVs parsimoniously.\n",
+      "- Plan B: LIML and Anderson–Rubin tests in the structural step.\n", sep = "")
+}
+fs_tab$value <- round(as.numeric(fs_tab$value), 5)
+print(fs_tab, row.names = FALSE)
+```
+
+```{r 2SLS_rates_lagged, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({library(dplyr)})
+
+
+pick <- function(df, opts) { f <- intersect(opts, names(df)); if (length(f)) f[1] else NA_character_ }
+vcov_cl <- function(mod, cluster=NULL){
+  if(!is.null(cluster) && requireNamespace("sandwich", quietly=TRUE)) return(sandwich::vcovCL(mod, cluster=cluster))
+  vcov(mod)
+}
+coef_tab <- function(m, V=NULL){
+  if(is.null(V)) V <- vcov(m); b <- coef(m); se <- sqrt(diag(V)); t <- b/se
+  data.frame(term=names(b), estimate=b, std.error=se, t=t, p=2*pt(-abs(t), df=df.residual(m)))
+}
+
+
+col_region <- pick(panel, c("cbsa","cbsa_code","cbsa_fips","cbsa_id","region","msa","cz"))
+col_year   <- pick(panel, c("year","yr"))
+col_q      <- pick(panel, c("quarter","qtr","quarter_number"))
+col_U      <- pick(panel, c("u_22_27_ba","u_ba_22_27","unemp_ba_22_27","urate_ba_22_27","u_ba"))
+
+
+col_D_rate <- pick(panel, c("demand_post_rt","postings_rt","post_per_young","ba_postings_rate"))
+col_D_idx  <- pick(panel, c("d_post","postings_index"))
+
+
+col_S_rate <- pick(panel, c("supply_flow_rt","ba_flow_rt","s_flow_rt"))
+col_flow   <- pick(panel, c("flow_ba","s_flow"))
+col_popY   <- pick(panel, c("pop_22_27","young_pop","lf_w"))
+
+
+col_Bartik <- pick(panel, c("bartik_demand","demand_bartik_rt","bartik","d_bart","bartik_rt"))
+sIV <- intersect(c("supply_iv","supplyiv","cohort_size","cohort_growth","hs_grads",
+                   "hs_grad_cohort","capacity","capacity_iv","funding_iv","funding_shock",
+                   "tuition_shock","flow_ba_l1","flow_ba_l2","flow_ba_l3"), names(panel))
+
+stopifnot(!is.na(col_region), !is.na(col_year), !is.na(col_q), !is.na(col_U), !is.na(col_Bartik))
+
+
+DF0 <- panel |>
+  transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_q]]),
+    t_id   = interaction(year, qnum, drop=TRUE),
+    U      = as.numeric(.data[[col_U]]),
+    D_raw  = if (!is.na(col_D_rate)) as.numeric(.data[[col_D_rate]])
+             else if (!is.na(col_D_idx)) as.numeric(.data[[col_D_idx]]) else NA_real_,
+    S_raw  = if (!is.na(col_S_rate)) as.numeric(.data[[col_S_rate]])
+             else if (!is.na(col_flow) & !is.na(col_popY))
+               as.numeric(.data[[col_flow]]) / as.numeric(.data[[col_popY]])
+             else if (!is.na(col_flow)) as.numeric(.data[[col_flow]]) else NA_real_,
+    Bartik = as.numeric(.data[[col_Bartik]]),
+    !!!setNames(panel[, sIV, drop=FALSE], sIV)
+  ) |>
+  filter(is.finite(U) & is.finite(D_raw) & is.finite(S_raw) & is.finite(Bartik)) |>
+  arrange(region, year, qnum) |>
+  group_by(region) |>
+  mutate(
+    D  = as.numeric(scale(D_raw)),
+    S  = as.numeric(scale(S_raw)),
+    Dl1 = dplyr::lag(D, 1),
+    Sl1 = dplyr::lag(S, 1),
+    Bartik_l1 = dplyr::lag(Bartik, 1)
+  ) |>
+  ungroup() |>
+  filter(is.finite(Dl1) & is.finite(Sl1) & is.finite(Bartik_l1))
+
+
+rhsFE <- "factor(region) + factor(t_id)"
+fs_D <- lm(as.formula(paste("Dl1 ~ Bartik_l1 +", rhsFE)), DF0); DF0$Dl1_hat <- fitted(fs_D)
+
+if (length(sIV) > 0) {
+  fs_S <- lm(as.formula(paste("Sl1 ~", paste(sIV, collapse=" + "), "+", rhsFE)), DF0)
+  DF0$Sl1_hat <- fitted(fs_S)
+} else {
+  DF0$Sl1_hat <- NA_real_
+}
+
+
+endog <- c("Dl1_hat", if(length(sIV)>0) "Sl1_hat")
+form2 <- as.formula(paste("U ~", paste(c(endog, rhsFE), collapse=" + ")))
+m2 <- lm(form2, DF0)
+V2 <- vcov_cl(m2, cluster = ~ DF0$region)
+tab <- coef_tab(m2, V2) |>
+  dplyr::filter(term %in% endog) |>
+  mutate(term = dplyr::recode(term, Dl1_hat="D_lag", Sl1_hat="S_lag")) |>
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+cat("\n=== 2SLS on lagged rates (standardized) ===\n")
+print(tab, row.names = FALSE)
+
+
+sdU <- sd(DF0$U, na.rm=TRUE)
+eff <- tibble::tibble(
+  variable = c("D_lag","S_lag")[1:length(endog)],
+  per_SD_change_in_U = tab$estimate * sd(DF0$D, na.rm=TRUE)[1]
+)
+```
+
+```{r refine_suite_power_up, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({library(dplyr)})
+
+
+pick <- function(df, opts) { f <- intersect(opts, names(df)); if (length(f)) f[1] else NA_character_ }
+winsor <- function(x, p=0.01){
+  qs <- quantile(x, c(p, 1-p), na.rm=TRUE); x <- pmin(pmax(x, qs[1]), qs[2]); as.numeric(x)
+}
+vcov_cl <- function(m, cluster=NULL){
+  if(!is.null(cluster) && requireNamespace("sandwich", quietly=TRUE)) return(sandwich::vcovCL(m, cluster=cluster))
+  vcov(m)
+}
+coef_tab <- function(m, V=NULL){
+  if(is.null(V)) V <- vcov(m); b <- coef(m); se <- sqrt(diag(V)); t <- b/se
+  data.frame(term=names(b), estimate=b, se=se, p=2*pt(-abs(t), df=df.residual(m)))
+}
+run_iv_manual <- function(data, y, endog_hat, fe_terms, w=NULL, cluster_vec=NULL){
+  rhs <- paste(c(endog_hat, fe_terms), collapse=" + ")
+  fm  <- as.formula(paste(y, "~", rhs))
+  if(is.null(w)) mod <- lm(fm, data) else mod <- lm(fm, data, weights=w)
+  V <- vcov_cl(mod, cluster = cluster_vec)
+  out <- coef_tab(mod, V) |>
+    dplyr::filter(term %in% endog_hat) |>
+    dplyr::mutate(term = sub("_hat$","", term))
+  attr(out, "vcov") <- V; attr(out, "model") <- mod; out
+}
+sum_lag_effect <- function(model, terms){
+  V <- vcov_cl(model); b <- coef(model)
+  a <- as.numeric(names(b) %in% terms)
+  est <- sum(b[terms]); se <- sqrt(t(a) %*% V %*% a)
+  p <- 2*pt(-abs(est/se), df=df.residual(model))
+  c(est=est, se=se, p=p)
+}
+
+
+col_region <- pick(panel, c("cbsa","cbsa_code","cbsa_fips","cbsa_id","region","msa","cz"))
+col_year   <- pick(panel, c("year","yr"))
+col_q      <- pick(panel, c("quarter","qtr","quarter_number"))
+col_U      <- pick(panel, c("u_22_27_ba","u_ba_22_27","unemp_ba_22_27","urate_ba_22_27","u_ba"))
+col_D_rate <- pick(panel, c("demand_post_rt","postings_rt","post_per_young","ba_postings_rate"))
+col_D_idx  <- pick(panel, c("d_post","postings_index"))
+col_S_rate <- pick(panel, c("supply_flow_rt","ba_flow_rt","s_flow_rt"))
+col_flow   <- pick(panel, c("flow_ba","s_flow"))
+col_popY   <- pick(panel, c("pop_22_27","young_pop","lf_w"))
+col_Bartik <- pick(panel, c("bartik_demand","demand_bartik_rt","bartik","d_bart","bartik_rt"))
+sIV <- intersect(c("supply_iv","supplyiv","cohort_size","cohort_growth","hs_grads",
+                   "hs_grad_cohort","capacity","capacity_iv","funding_iv","funding_shock",
+                   "tuition_shock","flow_ba_l1","flow_ba_l2","flow_ba_l3"), names(panel))
+
+stopifnot(!is.na(col_region), !is.na(col_year), !is.na(col_q), !is.na(col_U), !is.na(col_Bartik))
+
+
+Q <- panel |>
+  transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_q]]),
+    t_id   = interaction(year, qnum, drop=TRUE),
+    U      = as.numeric(.data[[col_U]]),
+    D_raw  = if (!is.na(col_D_rate)) as.numeric(.data[[col_D_rate]])
+             else if (!is.na(col_D_idx)) as.numeric(.data[[col_D_idx]]) else NA_real_,
+    S_raw  = if (!is.na(col_S_rate)) as.numeric(.data[[col_S_rate]])
+             else if (!is.na(col_flow) & !is.na(col_popY))
+               as.numeric(.data[[col_flow]]) / as.numeric(.data[[col_popY]])
+             else if (!is.na(col_flow)) as.numeric(.data[[col_flow]]) else NA_real_,
+    Bartik = as.numeric(.data[[col_Bartik]]),
+    w_pop  = if(!is.na(col_popY)) as.numeric(.data[[col_popY]]) else 1,
+    !!!setNames(panel[, sIV, drop=FALSE], sIV)
+  ) |>
+  filter(is.finite(U) & is.finite(D_raw) & is.finite(S_raw) & is.finite(Bartik)) |>
+  arrange(region, year, qnum) |>
+  group_by(region) |>
+  mutate(
+    D  = as.numeric(scale(D_raw)),
+    S  = as.numeric(scale(S_raw)),
+    Dl1 = dplyr::lag(D, 1), Dl2 = dplyr::lag(D, 2), Dl3 = dplyr::lag(D, 3), Dl4 = dplyr::lag(D, 4),
+    Sl1 = dplyr::lag(S, 1), Sl2 = dplyr::lag(S, 2), Sl3 = dplyr::lag(S, 3), Sl4 = dplyr::lag(S, 4),
+    Bartik_l1 = dplyr::lag(Bartik, 1),
+    Bartik_l2 = dplyr::lag(Bartik, 2),
+    Bartik_l3 = dplyr::lag(Bartik, 3),
+    Bartik_l4 = dplyr::lag(Bartik, 4)
+  ) |>
+  ungroup()
+
+
+A <- Q |>
+  filter(is.finite(Dl1), is.finite(Sl1), is.finite(Bartik_l1)) |>
+  mutate(Dl1 = winsor(Dl1, .01), Sl1 = winsor(Sl1, .01),
+         Bartik_l1 = winsor(Bartik_l1, .01),
+         across(all_of(sIV), winsor, .01))
+
+
+fs_D_A <- lm(Dl1 ~ Bartik_l1 + factor(region) + factor(t_id), A); A$Dl1_hat <- fitted(fs_D_A)
+if (length(sIV) > 0) { fs_S_A <- lm(as.formula(paste("Sl1 ~", paste(c(sIV,"factor(region)","factor(t_id)"), collapse=" + "))), A); A$Sl1_hat <- fitted(fs_S_A) } else { A$Sl1_hat <- NA_real_ }
+
+res_A_unw <- run_iv_manual(A, "U", c("Dl1_hat","Sl1_hat"), c("factor(region)","factor(t_id)"), w=NULL, cluster_vec=~A$region)
+res_A_w   <- run_iv_manual(A, "U", c("Dl1_hat","Sl1_hat"), c("factor(region)","factor(t_id)"), w=A$w_pop, cluster_vec=~A$region)
+
+
+B <- Q |>
+  filter(across(c(Dl1:Dl4, Sl1:Sl4, Bartik_l1:Bartik_l4), is.finite))
+
+
+fs_D_B <- lm(cbind(Dl1, Dl2, Dl3, Dl4) ~ Bartik_l1 + Bartik_l2 + Bartik_l3 + Bartik_l4 + factor(region) + factor(t_id), B)
+B$Dl1_hat <- fitted(fs_D_B)[,1]; B$Dl2_hat <- fitted(fs_D_B)[,2]; B$Dl3_hat <- fitted(fs_D_B)[,3]; B$Dl4_hat <- fitted(fs_D_B)[,4]
+
+if (length(sIV) > 0) {
+  fs_S_B <- lm(cbind(Sl1, Sl2, Sl3, Sl4) ~ . + factor(region) + factor(t_id),
+               data = B[, c("Sl1","Sl2","Sl3","Sl4","region","t_id", sIV), drop=FALSE])
+  B$Sl1_hat <- fitted(fs_S_B)[,1]; B$Sl2_hat <- fitted(fs_S_B)[,2]; B$Sl3_hat <- fitted(fs_S_B)[,3]; B$Sl4_hat <- fitted(fs_S_B)[,4]
+} else {
+  B$Sl1_hat <- B$Sl2_hat <- B$Sl3_hat <- B$Sl4_hat <- NA_real_
+}
+
+endog_B <- c("Dl1_hat","Dl2_hat","Dl3_hat","Dl4_hat", if(length(sIV)>0) c("Sl1_hat","Sl2_hat","Sl3_hat","Sl4_hat"))
+rhsFE <- c("factor(region)","factor(t_id)")
+fm_B <- as.formula(paste("U ~", paste(c(endog_B, rhsFE), collapse=" + ")))
+m_B <- lm(fm_B, B)
+V_B <- vcov_cl(m_B, cluster=~B$region)
+
+sumD <- sum_lag_effect(m_B, c("Dl1_hat","Dl2_hat","Dl3_hat","Dl4_hat"))
+
+sumS <- if(length(sIV)>0) sum_lag_effect(m_B, c("Sl1_hat","Sl2_hat","Sl3_hat","Sl4_hat")) else c(est=NA, se=NA, p=NA)
+
+
+Y <- Q |>
+  group_by(region, year) |>
+  summarise(U = mean(U, na.rm=TRUE),
+            D = mean(D, na.rm=TRUE),
+            S = mean(S, na.rm=TRUE),
+            Bartik = mean(Bartik, na.rm=TRUE),
+            w_pop = mean(w_pop, na.rm=TRUE),
+            across(all_of(sIV), ~ mean(.x, na.rm=TRUE)),
+            .groups="drop") |>
+  arrange(region, year) |>
+  group_by(region) |>
+  mutate(Dl1 = dplyr::lag(D, 1), Sl1 = dplyr::lag(S, 1), Bartik_l1 = dplyr::lag(Bartik, 1)) |>
+  ungroup() |>
+  filter(is.finite(Dl1), is.finite(Sl1), is.finite(Bartik_l1)) |>
+  mutate(t_id = factor(year))
+
+fs_D_Y <- lm(Dl1 ~ Bartik_l1 + factor(region) + factor(t_id), Y); Y$Dl1_hat <- fitted(fs_D_Y)
+if (length(sIV) > 0) { fs_S_Y <- lm(as.formula(paste("Sl1 ~", paste(c(sIV,"factor(region)","factor(t_id)"), collapse=" + "))), Y); Y$Sl1_hat <- fitted(fs_S_Y) } else { Y$Sl1_hat <- NA_real_ }
+res_Y_w <- run_iv_manual(Y, "U", c("Dl1_hat","Sl1_hat"), c("factor(region)","factor(t_id)"), w=Y$w_pop, cluster_vec=~Y$region)
+
+
+tbl <- bind_rows(
+  tibble(spec="Quarterly L1 (winsor, unweighted)", res_A_unw),
+  tibble(spec="Quarterly L1 (winsor, weighted)",   res_A_w),
+  tibble(spec="Annual L1 (weighted)",              res_Y_w)
+) |>
+  select(spec, term, estimate, se, p)
+
+cum <- tibble(
+  spec = "Quarterly DL L1–L4 (cumulative)",
+  term = c("D_lags_sum","S_lags_sum"[length(sIV)>0]),
+  estimate = c(sumD["est"], sumS["est"]),
+  se       = c(sumD["se"],  sumS["se"]),
+  p        = c(sumD["p"],   sumS["p"])
+)
+
+cat("\n=== Power-oriented specs (manual 2SLS with FE; clustered SEs if 'sandwich' is installed) ===\n")
+print(bind_rows(tbl, cum) %>% mutate(across(where(is.numeric), ~round(., 4))))
+```
+
+```{r iv_cumulative_power_fixed, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({library(dplyr)})
+
+
+vcov_cl <- function(m, cluster=NULL){
+  if(!is.null(cluster) && requireNamespace("sandwich", quietly=TRUE)) return(sandwich::vcovCL(m, cluster=cluster))
+  vcov(m)
+}
+coef_tab <- function(m, V=NULL){
+  if(is.null(V)) V <- vcov(m); b<-coef(m); se<-sqrt(diag(V)); t<-b/se
+  data.frame(term=names(b), estimate=b, std.error=se, t=t, p=2*pt(-abs(t), df=df.residual(m)))
+}
+wald_F <- function(model, terms, V=NULL){
+  if(is.null(V)) V <- vcov(model); b <- coef(model)[terms]; if(any(is.na(b))) return(NA_real_)
+  q <- length(terms); as.numeric(t(b) %*% solve(V[terms,terms,drop=FALSE]) %*% b) / q
+}
+partial_R2 <- function(m0, m1){ sse0 <- sum(resid(m0)^2); sse1 <- sum(resid(m1)^2); (sse0-sse1)/sse0 }
+
+
+Q <- panel %>%
+  transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_q]]),
+    t_id   = interaction(year, qnum, drop = TRUE),
+    U      = as.numeric(.data[[col_U]]),
+    D_raw  = if (!is.na(col_D_rate)) as.numeric(.data[[col_D_rate]])
+             else if (!is.na(col_D_idx)) as.numeric(.data[[col_D_idx]]) else NA_real_,
+    S_raw  = if (!is.na(col_S_rate)) as.numeric(.data[[col_S_rate]])
+             else if (!is.na(col_flow) & !is.na(col_popY))
+               as.numeric(.data[[col_flow]]) / as.numeric(.data[[col_popY]])
+             else if (!is.na(col_flow)) as.numeric(.data[[col_flow]]) else NA_real_,
+    Bartik = as.numeric(.data[[col_Bartik]]),
+    !!!setNames(panel[, sIV, drop = FALSE], sIV)
+  ) %>%
+  filter(is.finite(U) & is.finite(D_raw) & is.finite(S_raw) & is.finite(Bartik)) %>%
+  mutate(pandemic = (year == 2020 & qnum >= 2) | (year == 2021)) %>%
+  filter(!pandemic) %>%
+  arrange(region, year, qnum) %>%
+  group_by(region) %>%
+  mutate(
+    D  = as.numeric(scale(D_raw)),
+    S  = as.numeric(scale(S_raw)),
+    Dl1 = dplyr::lag(D, 1), Dl2 = dplyr::lag(D, 2), Dl3 = dplyr::lag(D, 3), Dl4 = dplyr::lag(D, 4),
+    Sl1 = dplyr::lag(S, 1), Sl2 = dplyr::lag(S, 2), Sl3 = dplyr::lag(S, 3), Sl4 = dplyr::lag(S, 4),
+    B1  = dplyr::lag(Bartik, 1), B2 = dplyr::lag(Bartik, 2), B3 = dplyr::lag(Bartik, 3), B4 = dplyr::lag(Bartik, 4)
+  ) %>%
+  ungroup() %>%
+  filter(dplyr::if_all(dplyr::all_of(c("Dl1","Dl2","Dl3","Dl4","Sl1","Sl2","Sl3","Sl4","B1","B2","B3","B4")),
+                       ~ is.finite(.x))) %>%
+
+  mutate(
+    Dsum = Dl1 + Dl2 + Dl3 + Dl4,
+    Ssum = Sl1 + Sl2 + Sl3 + Sl4
+  ) %>%
+  filter(is.finite(Dsum))
+
+
+fsD0 <- lm(Dsum ~ factor(region) + factor(t_id), Q)
+fsD1 <- lm(Dsum ~ B1 + B2 + B3 + B4 + factor(region) + factor(t_id), Q)
+Q$Dsum_hat <- fitted(fsD1)
+F_Dsum <- wald_F(fsD1, c("B1","B2","B3","B4"))
+R2p_D  <- partial_R2(fsD0, fsD1)
+
+if (length(sIV) > 0) {
+  fsS0 <- lm(Ssum ~ factor(region) + factor(t_id), Q)
+  fsS1 <- lm(as.formula(paste("Ssum ~", paste(c(sIV,"factor(region)","factor(t_id)"), collapse=" + "))), Q)
+  Q$Ssum_hat <- fitted(fsS1)
+  F_Ssum <- wald_F(fsS1, sIV)
+  R2p_S  <- partial_R2(fsS0, fsS1)
+} else {
+  Q$Ssum_hat <- NA_real_; F_Ssum <- NA_real_; R2p_S <- NA_real_
+}
+
+cat(sprintf("First-stage (Dsum): partial R^2 = %.3f | KP rk F = %.2f\n", R2p_D, F_Dsum))
+if (!is.na(F_Ssum)) cat(sprintf("First-stage (Ssum): partial R^2 = %.3f | KP rk F = %.2f\n", R2p_S, F_Ssum))
+
+
+m2_D  <- lm(U ~ Dsum_hat + factor(region) + factor(t_id), Q)
+V_D   <- vcov_cl(m2_D, cluster = ~ Q$region)
+tabD  <- coef_tab(m2_D, V_D) %>% dplyr::filter(term=="Dsum_hat") %>% dplyr::mutate(term="Dsum")
+
+m2_DS <- lm(U ~ Dsum_hat + Ssum_hat + factor(region) + factor(t_id), Q)
+V_DS  <- vcov_cl(m2_DS, cluster = ~ Q$region)
+tabDS <- coef_tab(m2_DS, V_DS) %>%
+  dplyr::filter(term %in% c("Dsum_hat","Ssum_hat")) %>%
+  dplyr::mutate(term = dplyr::recode(term, Dsum_hat="Dsum", Ssum_hat="Ssum"))
+
+cat("\n=== 2SLS on cumulative lags (standardized rates) ===\n")
+print(rbind(
+  cbind(model="Dsum only", tabD),
+  cbind(model="Dsum & Ssum", tabDS)
+) %>% dplyr::mutate(across(where(is.numeric), ~ round(., 4))), row.names = FALSE)
+```
+
+```{r robustness_83_87_90_fixed, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({library(dplyr)})
+
+
+pick <- function(df, opts){ f <- intersect(opts, names(df)); if (length(f)) f[1] else NA_character_ }
+vcov_1way <- function(m, cluster){
+  if (requireNamespace("sandwich", quietly=TRUE)) sandwich::vcovCL(m, cluster=cluster) else vcov(m)
+}
+vcov_2way <- function(m, cl1, cl2){
+  if (requireNamespace("multiwayvcov", quietly=TRUE)) {
+    multiwayvcov::vcovDC(m, cluster = data.frame(cl1=cl1, cl2=cl2))
+  } else {
+    attr(m, "two_way_note") <- "multiwayvcov not installed; fell back to region clustering."
+    vcov_1way(m, cluster = ~cl1)
+  }
+}
+tidy_coef <- function(m, V, terms){
+  b <- coef(m)[terms]; se <- sqrt(diag(V))[terms]; t <- b/se
+  data.frame(term=terms, estimate=b, std.error=se, t=t,
+             p=2*pt(-abs(t), df=df.residual(m)), row.names=NULL, check.names=FALSE)
+}
+wald_joint <- function(m, terms, V=NULL){
+  if (is.null(V)) V <- vcov(m)
+  b <- coef(m)[terms]; if (any(is.na(b))) return(c(F=NA, p=NA))
+  q <- length(terms); F <- as.numeric(t(b) %*% solve(V[terms,terms,drop=FALSE]) %*% b) / q
+  p <- pf(F, q, df.residual(m), lower.tail=FALSE); c(F=F, p=p)
+}
+round_df <- function(x, k=4){ dplyr::mutate(x, dplyr::across(where(is.numeric), ~round(.x, k))) }
+
+
+col_region <- pick(panel, c("cbsa","cbsa_code","cbsa_fips","cbsa_id","region","msa","cz"))
+col_year   <- pick(panel, c("year","yr"))
+col_q      <- pick(panel, c("quarter","qtr","quarter_number"))
+col_U      <- pick(panel, c("u_22_27_ba","u_ba_22_27","unemp_ba_22_27","urate_ba_22_27","u_ba"))
+col_D_rate <- pick(panel, c("demand_post_rt","postings_rt","post_per_young","ba_postings_rate"))
+col_D_idx  <- pick(panel, c("d_post","postings_index"))
+col_S_rate <- pick(panel, c("supply_flow_rt","ba_flow_rt","s_flow_rt"))
+col_flow   <- pick(panel, c("flow_ba","s_flow"))
+col_popY   <- pick(panel, c("pop_22_27","young_pop","lf_w"))
+col_Bartik <- pick(panel, c("bartik_demand","demand_bartik_rt","bartik","d_bart","bartik_rt"))
+
+stopifnot(!is.na(col_region), !is.na(col_year), !is.na(col_q), !is.na(col_U), !is.na(col_Bartik))
+
+
+Qr <- panel %>%
+  transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_q]]),
+    t_id   = interaction(year, qnum, drop=TRUE),
+    U      = as.numeric(.data[[col_U]]),
+    D_raw  = if (!is.na(col_D_rate)) as.numeric(.data[[col_D_rate]])
+             else if (!is.na(col_D_idx)) as.numeric(.data[[col_D_idx]]) else NA_real_,
+    S_raw  = if (!is.na(col_S_rate)) as.numeric(.data[[col_S_rate]])
+             else if (!is.na(col_flow) & !is.na(col_popY))
+               as.numeric(.data[[col_flow]]) / as.numeric(.data[[col_popY]])
+             else if (!is.na(col_flow)) as.numeric(.data[[col_flow]]) else NA_real_,
+    Bartik = as.numeric(.data[[col_Bartik]]),
+    size_w = if (!is.na(col_popY)) as.numeric(.data[[col_popY]]) else NA_real_
+  ) %>%
+  filter(is.finite(U) & is.finite(D_raw) & is.finite(S_raw) & is.finite(Bartik)) %>%
+  mutate(pandemic = (year==2020 & qnum>=2) | (year==2021)) %>%
+  filter(!pandemic) %>%
+  arrange(region, year, qnum) %>%
+  group_by(region) %>%
+  mutate(
+    D  = as.numeric(scale(D_raw)),
+    S  = as.numeric(scale(S_raw)),
+    Dl1 = dplyr::lag(D,1), Dl2 = dplyr::lag(D,2), Dl3 = dplyr::lag(D,3), Dl4 = dplyr::lag(D,4),
+    Sl1 = dplyr::lag(S,1), Sl2 = dplyr::lag(S,2), Sl3 = dplyr::lag(S,3), Sl4 = dplyr::lag(S,4),
+    B1  = dplyr::lag(Bartik,1), B2 = dplyr::lag(Bartik,2), B3 = dplyr::lag(Bartik,3), B4 = dplyr::lag(Bartik,4)
+  ) %>%
+  ungroup() %>%
+  filter(dplyr::if_all(dplyr::all_of(c("Dl1","Dl2","Dl3","Dl4","Sl1","Sl2","Sl3","Sl4","B1","B2","B3","B4")), ~is.finite(.x))) %>%
+  mutate(Dsum = Dl1+Dl2+Dl3+Dl4,
+         Ssum = Sl1+Sl2+Sl3+Sl4)
+
+
+fsD_full <- lm(Dsum ~ B1 + B2 + B3 + B4 + factor(region) + factor(t_id), Qr)
+Qr$Dsum_hat <- fitted(fsD_full)
+
+
+m_base <- lm(U ~ Dsum_hat + factor(region) + factor(t_id), Qr)
+
+
+m_rf  <- lm(U ~ B1 + B2 + B3 + B4 + factor(region) + factor(t_id), Qr)
+V_rf  <- vcov_1way(m_rf, cluster = ~Qr$region)
+rf_tab   <- tidy_coef(m_rf, V_rf, c("B1","B2","B3","B4"))
+rf_joint <- wald_joint(m_rf, c("B1","B2","B3","B4"), V_rf)
+
+cat("\n=== (83) Reduced form: U ~ Bartik lags + FE (region-clustered SEs) ===\n")
+print(round_df(rf_tab, 4))
+cat(sprintf("Joint Wald F (B1..B4) = %.2f, p = %.4f\n", rf_joint["F"], rf_joint["p"]))
+
+
+if (!all(is.na(Qr$size_w))) {
+  top5 <- Qr %>%
+    dplyr::group_by(region) %>%
+    dplyr::summarise(size = mean(size_w, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(size)) %>%
+    dplyr::slice_head(n = 5) %>%
+    dplyr::pull(region)
+} else {
+  top5 <- Qr %>%
+    dplyr::count(region, sort = TRUE) %>%
+    dplyr::slice_head(n = 5) %>%
+    dplyr::pull(region)
+}
+
+Qr_small <- Qr %>% dplyr::filter(!(region %in% top5))
+
+
+fsD_small <- lm(Dsum ~ B1 + B2 + B3 + B4 + factor(region) + factor(t_id), data = Qr_small)
+Qr_small$Dsum_hat <- fitted(fsD_small)
+
+
+m_drop5 <- lm(U ~ Dsum_hat + factor(region) + factor(t_id), data = Qr_small)
+
+
+V_drop5 <- if (requireNamespace("sandwich", quietly = TRUE)) {
+  sandwich::vcovCL(m_drop5, cluster = ~ Qr_small$region)
+} else vcov(m_drop5)
+
+b  <- coef(m_drop5)["Dsum_hat"]
+se <- sqrt(diag(V_drop5))["Dsum_hat"]
+t  <- as.numeric(b/se)
+p  <- 2*pt(-abs(t), df = df.residual(m_drop5))
+
+print(data.frame(model="Drop top-5", term="Dsum",
+                 estimate=b, std.error=se, t=t, p=p))
+cat("Dropped regions:\n"); print(top5)
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+
+
+
+
+
+add <- read_parquet("~/Journal_Project_2025/data_final/panel_additions_cbsa_q.parquet")
+
+keys <- c("cbsa","year","quarter")
+
+
+panel <- panel %>%
+  mutate(cbsa = as.character(cbsa),
+         year = as.integer(year),
+         quarter = as.integer(quarter))
+
+add <- add %>%
+  mutate(cbsa = as.character(cbsa),
+         year = as.integer(year),
+         quarter = as.integer(quarter))
+
+
+stopifnot(
+  nrow(add %>% count(across(all_of(keys))) %>% filter(n > 1)) == 0
+)
+
+
+
+add_cols <- setdiff(names(add), keys)
+collide  <- intersect(add_cols, names(panel))
+if (length(collide)) {
+  add <- add %>% rename_with(~ paste0(.x, "_add"), all_of(collide))
+}
+
+
+panel <- panel %>%
+  left_join(select(add, all_of(keys), any_of(c("d_entry_idx",
+                                               "bartik_entry",
+                                               "u_22_27_nonba",
+                                               "u_28_35_ba",
+                                               paste0(collide, "_add")))),
+            by = keys)
+
+
+summary(select(panel, dplyr::any_of(c("d_entry_idx","bartik_entry","u_22_27_nonba","u_28_35_ba"))))
+```
+
+```{r four_robustness_tests_fixed2, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({ library(dplyr) })
+
+
+has2 <- function(x) length(unique(x[is.finite(x) & !is.na(x)])) >= 2
+vcov_smart <- function(m, cluster_vec=NULL){
+  if (requireNamespace("sandwich", quietly=TRUE)){
+    if (!is.null(cluster_vec) && has2(cluster_vec)) sandwich::vcovCL(m, cluster=cluster_vec)
+    else sandwich::vcovHC(m, type="HC1")
+  } else vcov(m)
+}
+coef_row <- function(m, nm, V){
+  b  <- coef(m)[nm]; se <- sqrt(diag(V))[nm]
+  t  <- as.numeric(b/se); p <- 2*pt(-abs(t), df = df.residual(m))
+  data.frame(term=nm, estimate=b, std.error=se, t=t, p=p, row.names=NULL)
+}
+wald_F <- function(m, V, names_vec){
+  b <- coef(m); keep <- intersect(names_vec, names(b))
+  if (!length(keep)) return(c(F=NA_real_, p=NA_real_))
+  bS <- matrix(b[keep], ncol=1); VS <- as.matrix(V[keep, keep, drop=FALSE]); k <- length(keep)
+  if (anyNA(VS) || k==0) return(c(F=NA_real_, p=NA_real_))
+  Fstat <- as.numeric(t(bS) %*% solve(VS) %*% bS / k); pval <- 1 - pf(Fstat, k, df.residual(m))
+  c(F=Fstat, p=pval)
+}
+fe_terms <- function(dat){
+  parts <- character(0)
+  if (has2(dat$region)) parts <- c(parts, "factor(region)")
+  if (has2(dat$t_id))   parts <- c(parts, "factor(t_id)")
+  if (length(parts)) paste("+", paste(parts, collapse=" + ")) else ""
+}
+
+
+stopifnot(exists("panel"))
+nm <- names(panel)
+col_region <- if ("region" %in% nm) "region" else "cbsa"
+col_year   <- "year"; col_q <- "quarter"
+col_U_ba   <- if ("u_22_27_ba" %in% nm) "u_22_27_ba" else stop("u_22_27_ba not found.")
+col_nonba  <- if ("u_22_27_nonba" %in% nm) "u_22_27_nonba" else if ("u_22_27_nonba_add" %in% nm) "u_22_27_nonba_add" else NA_character_
+col_u2835  <- if ("u_28_35_ba" %in% nm) "u_28_35_ba" else NA_character_
+col_ba_bartik <- if ("bartik_demand" %in% nm) "bartik_demand" else if ("bartik" %in% nm) "bartik" else if ("bartik_nonba" %in% nm) "bartik_nonba" else NA_character_
+col_entry_D  <- if ("d_entry_idx" %in% nm) "d_entry_idx" else NA_character_
+col_entry_IV <- if ("bartik_entry" %in% nm) "bartik_entry" else NA_character_
+
+Df <- panel %>%
+  transmute(
+    region = .data[[col_region]],
+    year   = .data[[col_year]],
+    q      = .data[[col_q]],
+    t_id   = interaction(year, q, drop=TRUE),
+    U_ba   = .data[[col_U_ba]],
+    U_non  = if (!is.na(col_nonba)) .data[[col_nonba]] else NA_real_,
+    U_2835 = if (!is.na(col_u2835)) .data[[col_u2835]] else NA_real_,
+    Bartik_ba = if (!is.na(col_ba_bartik)) .data[[col_ba_bartik]] else NA_real_,
+    D_entry   = if (!is.na(col_entry_D))  .data[[col_entry_D]]  else NA_real_,
+    IV_entry  = if (!is.na(col_entry_IV)) .data[[col_entry_IV]] else NA_real_
+  ) %>%
+  group_by(region) %>%
+  arrange(region, year, q, .by_group=TRUE) %>%
+  mutate(B1 = dplyr::lag(Bartik_ba, 1),
+         B2 = dplyr::lag(Bartik_ba, 2),
+         B3 = dplyr::lag(Bartik_ba, 3),
+         B4 = dplyr::lag(Bartik_ba, 4)) %>%
+  ungroup()
+
+round_df <- function(df) dplyr::mutate(df, dplyr::across(where(is.numeric), ~ round(.x, 6)))
+
+
+
+
+
+res1 <- list(info=NA, coef=NA)
+if (!is.na(col_entry_D) && !is.na(col_entry_IV)) {
+  Q1_fs <- Df %>% filter(is.finite(D_entry), is.finite(IV_entry))
+  if (nrow(Q1_fs) >= 10) {
+    fes1  <- fe_terms(Q1_fs)
+    fs1   <- lm(as.formula(paste0("D_entry ~ IV_entry ", fes1)), data=Q1_fs)
+    Vfs1  <- vcov_smart(fs1, cluster_vec = Q1_fs$region)
+    kp1   <- wald_F(fs1, Vfs1, "IV_entry")
+    Q1_2  <- Q1_fs %>% mutate(Dhat = fitted(fs1)) %>% filter(is.finite(U_ba), is.finite(Dhat))
+    if (nrow(Q1_2) >= 10) {
+
+      fes1b <- fe_terms(Q1_2)
+      m1   <- lm(as.formula(paste0("U_ba ~ Dhat ", fes1b)), data=Q1_2)
+      Vm1  <- vcov_smart(m1, cluster_vec = Q1_2$region)
+      res1$info <- data.frame(model="Alt demand 2SLS (entry)", n_fs=nrow(Q1_fs), n_ss=nrow(Q1_2),
+                              KP_F=kp1[["F"]], KP_p=kp1[["p"]])
+      res1$coef <- coef_row(m1, "Dhat", Vm1)
+    } else {
+      res1$info <- data.frame(model="Alt demand 2SLS (entry)", n_fs=nrow(Q1_fs), n_ss=nrow(Q1_2),
+                              KP_F=kp1[["F"]], KP_p=kp1[["p"]])
+      res1$coef <- data.frame(term="Dhat", estimate=NA, std.error=NA, t=NA, p=NA)
+    }
+  } else {
+    res1$info <- data.frame(model="Alt demand 2SLS (entry)", n_fs=nrow(Q1_fs), n_ss=NA, KP_F=NA, KP_p=NA)
+    res1$coef <- data.frame(term="Dhat", estimate=NA, std.error=NA, t=NA, p=NA)
+  }
+} else {
+  res1$info <- data.frame(model="Alt demand 2SLS (entry)", n_fs=NA, n_ss=NA, KP_F=NA, KP_p=NA)
+  res1$coef <- data.frame(term="Dhat", estimate=NA, std.error=NA, t=NA, p=NA)
+}
+
+
+
+
+res2 <- list(info=NA, coef=NA)
+if (!is.na(col_nonba) && !is.na(col_ba_bartik)) {
+  Q2 <- Df %>% filter(is.finite(U_ba), is.finite(U_non), is.finite(Bartik_ba), is.finite(B1), is.finite(B2), is.finite(B3), is.finite(B4))
+  if (nrow(Q2) >= 10){
+    fes2 <- fe_terms(Q2)
+    fs2  <- lm(as.formula(paste0("Bartik_ba ~ B1 + B2 + B3 + B4 ", fes2)), data=Q2)
+    Vfs2 <- vcov_smart(fs2, cluster_vec = Q2$region)
+    kp2  <- wald_F(fs2, Vfs2, c("B1","B2","B3","B4"))
+    Q2$Dhat2 <- fitted(fs2)
+    m2   <- lm(as.formula(paste0("U_ba ~ Dhat2 + U_non ", fes2)), data=Q2)
+    Vm2  <- vcov_smart(m2, cluster_vec = Q2$region)
+    res2$info <- data.frame(model="Main BA + non-BA control (2SLS via Bartik lags)",
+                            n=nrow(Q2), KP_F=kp2[["F"]], KP_p=kp2[["p"]])
+    res2$coef <- rbind(coef_row(m2, "Dhat2", Vm2), coef_row(m2, "U_non", Vm2))
+  } else {
+    res2$info <- data.frame(model="Main BA + non-BA control (2SLS)", n=nrow(Q2), KP_F=NA, KP_p=NA)
+    res2$coef <- data.frame(term=c("Dhat2","U_non"), estimate=NA, std.error=NA, t=NA, p=NA)
+  }
+} else {
+  res2$info <- data.frame(model="Main BA + non-BA control (2SLS)", n=NA, KP_F=NA, KP_p=NA)
+  res2$coef <- data.frame(term=c("Dhat2","U_non"), estimate=NA, std.error=NA, t=NA, p=NA)
+}
+
+
+
+
+res3 <- list(info=NA, coef=NA)
+if (!is.na(col_nonba) && !is.na(col_ba_bartik)) {
+  Q3 <- Df %>% filter(is.finite(U_non), is.finite(B1), is.finite(B2), is.finite(B3), is.finite(B4))
+  if (nrow(Q3) >= 10){
+    fes3 <- fe_terms(Q3)
+    rf3  <- lm(as.formula(paste0("U_non ~ B1 + B2 + B3 + B4 ", fes3)), data=Q3)
+    V3   <- vcov_smart(rf3, cluster_vec = Q3$region)
+    names_iv <- c("B1","B2","B3","B4")
+    tab3 <- do.call(rbind, lapply(names_iv, function(nm) coef_row(rf3, nm, V3)))
+    kp3  <- wald_F(rf3, V3, names_iv)
+    res3$info <- data.frame(model="Placebo (instrument): BA Bartik → non-BA U (RF)",
+                            n=nrow(Q3), Joint_Wald_F = kp3[["F"]], Joint_p = kp3[["p"]])
+    res3$coef <- tab3
+  } else {
+    res3$info <- data.frame(model="Placebo (instrument): BA Bartik → non-BA U (RF)", n=nrow(Q3),
+                            Joint_Wald_F=NA, Joint_p=NA)
+    res3$coef <- data.frame(term=c("B1","B2","B3","B4"),
+                            estimate=NA, std.error=NA, t=NA, p=NA)
+  }
+} else {
+  res3$info <- data.frame(model="Placebo (instrument): BA Bartik → non-BA U (RF)", n=NA,
+                          Joint_Wald_F=NA, Joint_p=NA)
+  res3$coef <- data.frame(term=c("B1","B2","B3","B4"),
+                          estimate=NA, std.error=NA, t=NA, p=NA)
+}
+
+
+
+
+res4 <- list(info=NA, coef=NA)
+if (!is.na(col_u2835) && !is.na(col_ba_bartik)) {
+  Q4 <- Df %>% filter(is.finite(U_2835), is.finite(Bartik_ba), is.finite(B1), is.finite(B2), is.finite(B3), is.finite(B4))
+  if (nrow(Q4) >= 10){
+    fes4 <- fe_terms(Q4)
+    fs4  <- lm(as.formula(paste0("Bartik_ba ~ B1 + B2 + B3 + B4 ", fes4)), data=Q4)
+    Vfs4 <- vcov_smart(fs4, cluster_vec = Q4$region)
+    kp4  <- wald_F(fs4, Vfs4, c("B1","B2","B3","B4"))
+    Q4$Dhat4 <- fitted(fs4)
+    m4   <- lm(as.formula(paste0("U_2835 ~ Dhat4 ", fes4)), data=Q4)
+    Vm4  <- vcov_smart(m4, cluster_vec = Q4$region)
+    res4$info <- data.frame(model="Placebo (outcome): BA 28–35 (2SLS via Bartik lags)",
+                            n=nrow(Q4), KP_F=kp4[["F"]], KP_p=kp4[["p"]])
+    res4$coef <- coef_row(m4, "Dhat4", Vm4)
+  } else {
+    res4$info <- data.frame(model="Placebo (outcome): BA 28–35 (2SLS)", n=nrow(Q4), KP_F=NA, KP_p=NA)
+    res4$coef <- data.frame(term="Dhat4", estimate=NA, std.error=NA, t=NA, p=NA)
+  }
+} else {
+  res4$info <- data.frame(model="Placebo (outcome): BA 28–35 (2SLS)", n=NA, KP_F=NA, KP_p=NA)
+  res4$coef <- data.frame(term="Dhat4", estimate=NA, std.error=NA, t=NA, p=NA)
+}
+
+
+cat("\n=== (1) Alt demand 2SLS: D = d_entry_idx, IV = bartik_entry ===\n")
+print(round_df(res1$info)); print(round_df(res1$coef))
+
+cat("\n=== (2) Main BA + control (non-BA U) — 2SLS with Bartik lags ===\n")
+print(round_df(res2$info)); print(round_df(res2$coef))
+
+cat("\n=== (3) Instrument placebo (RF): BA Bartik → non-BA youth unemployment ===\n")
+print(round_df(res3$info)); print(round_df(res3$coef))
+
+cat("\n=== (4) Outcome placebo (2SLS): outcome = BA ages 28–35 ===\n")
+print(round_df(res4$info)); print(round_df(res4$coef))
+```
+
+```{r}
+
+
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+})
+
+
+
+pick_col <- function(df, candidates) {
+  candidates <- candidates[candidates %in% names(df)]
+  if (length(candidates)) candidates[[1]] else NA_character_
+}
+
+finite_lags <- function(df, cand) {
+  cand <- intersect(cand, names(df))
+  keep <- vapply(cand, function(cl)
+    sum(is.finite(suppressWarnings(as.numeric(df[[cl]])))), numeric(1))
+  cand[keep > 0]
+}
+
+tidy_one <- function(mod, coef_name, label) {
+  sm <- summary(mod)$coef
+  if (!coef_name %in% rownames(sm)) {
+    return(data.frame(term = label, estimate = NA, std.error = NA, t = NA, p = NA))
+  }
+  c <- sm[coef_name, , drop = FALSE]
+  data.frame(
+    term = label,
+    estimate = as.numeric(c[1]),
+    std.error = as.numeric(c[2]),
+    t = as.numeric(c[3]),
+    p = as.numeric(c[4])
+  )
+}
+
+wald_F <- function(full, drop_vars) {
+
+  rhs <- as.character(formula(full))[3]
+  for (v in drop_vars) rhs <- gsub(paste0("\\+\\s*", v), "", rhs)
+  red <- update(full, paste(". ~", rhs))
+  a <- anova(red, full)
+  data.frame(F = a$`F`[2], p = a$`Pr(>F)`[2])
+}
+
+
+
+DF <- panel
+
+col_region <- pick_col(DF, c("region","cbsa","cbsa_code","cbsa_id"))
+col_year   <- pick_col(DF, c("year","YEAR"))
+col_q      <- pick_col(DF, c("qnum","quarter","qtr"))
+
+col_U_ba22 <- pick_col(DF, c("u_22_27_ba","u_ba_22_27","u_ba"))
+col_U_non  <- pick_col(DF, c("u_22_27_nonba_add","u_22_27_nonba","u_non"))
+col_U_ba28 <- pick_col(DF, c("u_28_35_ba"))
+
+col_D_main <- pick_col(DF, c("Dsum","D","postings_index","d_idx","demand_idx"))
+col_D_entry<- pick_col(DF, c("d_entry_idx"))
+
+col_BA_btk <- pick_col(DF, c("bartik_demand","bartik_ba","bartik","Bartik"))
+col_EN_btk <- pick_col(DF, c("bartik_entry"))
+col_NB_btk <- pick_col(DF, c("bartik_nonba"))
+
+stopifnot(!is.na(col_region), !is.na(col_year), !is.na(col_q))
+stopifnot(!is.na(col_U_ba22))
+stopifnot(!is.na(col_BA_btk))
+
+
+
+Q0 <- DF %>%
+  transmute(
+    region = .data[[col_region]],
+    year   = as.integer(.data[[col_year]]),
+    qnum   = as.integer(.data[[col_q]]),
+    t_id   = interaction(year, qnum, drop = TRUE),
+
+    U_ba22 = as.numeric(.data[[col_U_ba22]]),
+    U_non  = if (!is.na(col_U_non))  as.numeric(.data[[col_U_non]])  else NA_real_,
+    U_ba28 = if (!is.na(col_U_ba28)) as.numeric(.data[[col_U_ba28]]) else NA_real_,
+
+    D_main  = if (!is.na(col_D_main))  as.numeric(scale(.data[[col_D_main]]))  else NA_real_,
+    D_entry = if (!is.na(col_D_entry)) as.numeric(scale(.data[[col_D_entry]])) else NA_real_,
+
+    BA_btk = as.numeric(.data[[col_BA_btk]]),
+    EN_btk = if (!is.na(col_EN_btk)) as.numeric(.data[[col_EN_btk]]) else NA_real_,
+    NB_btk = if (!is.na(col_NB_btk)) as.numeric(.data[[col_NB_btk]]) else NA_real_
+  ) %>%
+  group_by(region) %>%
+  mutate(
+    B1  = dplyr::lag(BA_btk, 1), B2  = dplyr::lag(BA_btk, 2),
+    B3  = dplyr::lag(BA_btk, 3), B4  = dplyr::lag(BA_btk, 4),
+    B1e = dplyr::lag(EN_btk, 1), B2e = dplyr::lag(EN_btk, 2),
+    B3e = dplyr::lag(EN_btk, 3), B4e = dplyr::lag(EN_btk, 4),
+    B1n = dplyr::lag(NB_btk, 1), B2n = dplyr::lag(NB_btk, 2),
+    B3n = dplyr::lag(NB_btk, 3), B4n = dplyr::lag(NB_btk, 4)
+  ) %>%
+  ungroup()
+
+
+
+
+
+
+
+Out1 <- list(
+  header = data.frame(
+    model = "Alt demand 2SLS (entry) — D_entry via entry-Bartik lags",
+    n_fs  = 0, n_ss = NA, KP_F = NA, KP_p = NA
+  )
+)
+
+if (!is.na(col_D_entry) && !is.na(col_EN_btk)) {
+
+  Qe <- Q0 %>%
+    filter(is.finite(D_entry), is.finite(U_ba22)) %>%
+    filter(if_all(all_of(finite_lags(., c("B1e","B2e","B3e","B4e"))),
+                  ~ is.finite(suppressWarnings(as.numeric(.x)))))
+
+  iv_keep <- finite_lags(Qe, c("B1e","B2e","B3e","B4e"))
+
+  if (length(iv_keep) >= 1 && nrow(Qe) > 0) {
+    fs1 <- lm(as.formula(paste0("D_entry ~ ", paste(iv_keep, collapse = "+"),
+                                " + factor(region) + factor(t_id)")), data = Qe)
+    jf  <- wald_F(fs1, iv_keep)
+    Qe$D_entry_hat <- fitted(fs1)
+
+    ss1 <- lm(U_ba22 ~ D_entry_hat + factor(region) + factor(t_id), data = Qe)
+
+    Out1$header <- data.frame(
+      model = "Alt demand 2SLS (entry) — D_entry via entry-Bartik lags",
+      n_fs  = nobs(fs1), n_ss = nobs(ss1),
+      KP_F  = jf$F, KP_p = jf$p
+    )
+    Out1$coef <- tidy_one(ss1, "D_entry_hat", "Effect of entry-level demand (2SLS)")
+  }
+}
+
+
+
+
+
+
+
+Out2 <- list(
+  header = data.frame(model = "Main BA 2SLS + non-BA control", n = NA, KP_F = NA, KP_p = NA)
+)
+
+if (!is.na(col_D_main)) {
+  Qb <- Q0 %>%
+    filter(is.finite(D_main), is.finite(U_ba22)) %>%
+    filter(if_all(all_of(finite_lags(., c("B1","B2","B3","B4"))),
+                  ~ is.finite(suppressWarnings(as.numeric(.x)))))
+
+  iv_keep2 <- finite_lags(Qb, c("B1","B2","B3","B4"))
+
+  if (length(iv_keep2) >= 1 && nrow(Qb) > 0) {
+    fs2 <- lm(as.formula(paste0("D_main ~ ", paste(iv_keep2, collapse = "+"),
+                                " + factor(region) + factor(t_id)")), data = Qb)
+    jf2 <- wald_F(fs2, iv_keep2)
+    Qb$D_main_hat <- fitted(fs2)
+
+
+    rhs_ctrl <- if (!all(is.na(Qb$U_non))) " + U_non" else ""
+    ss2 <- lm(as.formula(paste0("U_ba22 ~ D_main_hat", rhs_ctrl,
+                                " + factor(region) + factor(t_id)")), data = Qb)
+
+    Out2$header <- data.frame(
+      model = "Main BA 2SLS + non-BA control",
+      n = nobs(ss2), KP_F = jf2$F, KP_p = jf2$p
+    )
+    Out2$coef <- bind_rows(
+      tidy_one(ss2, "D_main_hat", "Effect of demand (2SLS)"),
+      if (!all(is.na(Qb$U_non))) tidy_one(ss2, "U_non", "Control: non-BA U") else NULL
+    )
+  }
+}
+
+
+
+
+
+
+
+Out3 <- list(
+  header = data.frame(model = "Placebo (instrument): BA Bartik → non-BA U (RF)",
+                      n = NA, Joint_Wald_F = NA, Joint_p = NA)
+)
+
+if (!is.na(col_U_non) && !is.na(col_NB_btk)) {
+  Qr <- Q0 %>%
+    filter(is.finite(U_non)) %>%
+    filter(if_all(all_of(finite_lags(., c("B1","B2","B3","B4"))),
+                  ~ is.finite(suppressWarnings(as.numeric(.x)))))
+
+  iv_keep3 <- finite_lags(Qr, c("B1","B2","B3","B4"))
+
+  if (length(iv_keep3) >= 1 && nrow(Qr) > 0) {
+    rf <- lm(as.formula(paste0("U_non ~ ", paste(iv_keep3, collapse = "+"),
+                               " + factor(region) + factor(t_id)")), data = Qr)
+    jf3 <- wald_F(rf, iv_keep3)
+
+
+    sm <- summary(rf)$coef
+    rows <- iv_keep3[iv_keep3 %in% rownames(sm)]
+    per <- data.frame(
+      term = rows,
+      estimate = sm[rows,1],
+      std.error = sm[rows,2],
+      t = sm[rows,3],
+      p = sm[rows,4],
+      row.names = NULL
+    )
+
+    Out3$header <- data.frame(model = "Placebo (instrument): BA Bartik → non-BA U (RF)",
+                              n = nobs(rf), Joint_Wald_F = jf3$F, Joint_p = jf3$p)
+    Out3$perlag <- per
+  }
+}
+
+
+
+
+
+
+
+Out4 <- list(
+  header = data.frame(model = "Placebo (outcome): BA 28–35 (2SLS via BA Bartik lags)",
+                      n = NA, KP_F = NA, KP_p = NA)
+)
+
+if (!is.na(col_U_ba28) && !is.na(col_D_main)) {
+  Qp <- Q0 %>%
+    filter(is.finite(D_main), is.finite(U_ba28)) %>%
+    filter(if_all(all_of(finite_lags(., c("B1","B2","B3","B4"))),
+                  ~ is.finite(suppressWarnings(as.numeric(.x)))))
+
+  iv_keep4 <- finite_lags(Qp, c("B1","B2","B3","B4"))
+
+  if (length(iv_keep4) >= 1 && nrow(Qp) > 0) {
+    fs4 <- lm(as.formula(paste0("D_main ~ ", paste(iv_keep4, collapse = "+"),
+                                " + factor(region) + factor(t_id)")), data = Qp)
+    jf4 <- wald_F(fs4, iv_keep4)
+    Qp$D_main_hat4 <- fitted(fs4)
+
+    ss4 <- lm(U_ba28 ~ D_main_hat4 + factor(region) + factor(t_id), data = Qp)
+
+    Out4$header <- data.frame(
+      model = "Placebo (outcome): BA 28–35 (2SLS via BA Bartik lags)",
+      n = nobs(ss4), KP_F = jf4$F, KP_p = jf4$p
+    )
+    Out4$coef <- tidy_one(ss4, "D_main_hat4", "Effect of demand on BA 28–35 (2SLS)")
+  }
+}
+
+
+
+cat("\n=== (1) Alt demand 2SLS (entry) ===\n")
+print(Out1$header, row.names = FALSE)
+if (!is.null(Out1$coef)) print(Out1$coef, row.names = FALSE)
+
+cat("\n=== (2) Main BA 2SLS + non-BA control ===\n")
+print(Out2$header, row.names = FALSE)
+if (!is.null(Out2$coef)) print(Out2$coef, row.names = FALSE)
+
+cat("\n=== (3) Placebo (instrument): BA Bartik → non-BA U (reduced form) ===\n")
+print(Out3$header, row.names = FALSE)
+if (!is.null(Out3$perlag)) {
+  cat("Per-lag effects of BA Bartik on non-BA U:\n")
+  print(Out3$perlag, row.names = FALSE)
+}
+
+cat("\n=== (4) Placebo (outcome): BA 28–35 via BA Bartik (2SLS) ===\n")
+print(Out4$header, row.names = FALSE)
+if (!is.null(Out4$coef)) print(Out4$coef, row.names = FALSE)
+```

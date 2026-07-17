@@ -1,0 +1,7 @@
+pandas
+polars
+pyarrow
+duckdb
+rapidfuzz
+usaddress
+geopy
